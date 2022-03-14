@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Cross platform, rootless, and fast debootstrap.
-
-Designed to work anywhere you can run Python and Docker/Podman (e.g. a Mac laptop).
-
+"""
 * Tested only with Ubuntu Focal and Jammy
 * Right now LZMA decoding takes up most of the time. Parallelize it? Python's LZMA
   library does release the GIL.
-* Needs GPG verification
-
+* TODO: GPG verification
 """
 import fnmatch
 from http.client import HTTPConnection
@@ -35,7 +31,10 @@ from subprocess import PIPE
 from tarfile import TarInfo
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlparse
-from zstandard import ZstdDecompressor
+try:
+    from zstandard import ZstdDecompressor
+except ModuleNotFoundError:
+    pass
 
 ARCHIVE_URL = "http://archive.ubuntu.com/ubuntu/"
 PARSED_ARCHIVE_URL = urlparse(ARCHIVE_URL)
