@@ -7,6 +7,7 @@ Designed to work anywhere you can run Python and Docker/Podman (e.g. a Mac lapto
 * Right now LZMA decoding takes up most of the time. Parallelize it? Python's LZMA
   library does release the GIL.
 
+
 """
 import ctypes
 import lzma
@@ -35,6 +36,7 @@ from zstandard import ZstdDecompressor
 import shutil
 import tarfile
 
+
 def tarinfo_repr(self):
     info = dict()
     for a in self.__slots__:
@@ -43,6 +45,7 @@ def tarinfo_repr(self):
         except AttributeError:
             pass
     return "TarInfo(**{0:})".format(info)
+
 
 TarInfo.__repr__ = tarinfo_repr
 
@@ -54,11 +57,13 @@ BLOCKSIZE = tarfile.BLOCKSIZE
 
 if False:
     orig_getcomptype = tarfile._StreamProxy.getcomptype
+
     def getcomptype(self):
         print(self.buf[:4])
         if self.buf.startswith(b"\xFD\x2F\xB5\x28"):
             return "zstd"
         return orig_getcomptype(self)
+
 
 @classmethod
 def zstdopen(cls, name, mode="r", fileobj=None, **kwargs):
@@ -72,11 +77,12 @@ def zstdopen(cls, name, mode="r", fileobj=None, **kwargs):
     t._extfileobj = False
     return t
 
+
 tarfile.TarFile.zstdopen = zstdopen
 tarfile.TarFile.OPEN_METH["zstd"] = "zstdopen"
 
 
-SECOND_STAGE="""\
+SECOND_STAGE = """\
 #!/bin/bash
 set -e
 
@@ -121,7 +127,9 @@ rm /var/cache/ldconfig/aux-cache
 find /var/log -type f -exec truncate -s0 {} \;
 """
 
-SECOND_STAGE += f"echo deb http://archive.ubuntu.com/ubuntu/ {SUITE} main > /etc/apt/sources.list\n"
+SECOND_STAGE += (
+    f"echo deb http://archive.ubuntu.com/ubuntu/ {SUITE} main > /etc/apt/sources.list\n"
+)
 
 FIELDS = (
     "Package",
@@ -134,10 +142,11 @@ FIELDS = (
 )
 FIELDS_MATCHER = re.compile("^({}): (.*)$".format("|".join(FIELDS)))
 
+
 def is_excluded(name):
     if name.startswith("usr/share/doc/"):
         return True
-    
+
     if name.startswith("usr/share/man/"):
         return True
 
@@ -151,7 +160,7 @@ def packages_dict(packages):
         if line == "\n" and package:
             ret[package["Package"]] = package
             package = dict()
- 
+
         match = FIELDS_MATCHER.match(line)
         if match:
             key, value = match.group(1), match.group(2)
@@ -180,12 +189,14 @@ def get_dependencies(info):
 def get_needed_packages():
     with requests.get(ARCHIVE_URL + ARCHIVE_SUFFIX, stream=True) as r:
         r.raise_for_status()
-       
+
         with lzma.open(r.raw, "rt") as plain_f:
             packages_info = packages_dict(plain_f)
 
     required = set()
-    unprocessed = set([k for k, v in packages_info.items() if v["Priority"] == "required"])
+    unprocessed = set(
+        [k for k, v in packages_info.items() if v["Priority"] == "required"]
+    )
     unprocessed.add("apt")
     unprocessed.add("gpgv")
 
@@ -211,6 +222,7 @@ def get_needed_packages():
     ret = [packages_info[name] for name in required]
     random.shuffle(ret)
     return ret
+
 
 def copy_file_sha256(src, dst):
     hasher = sha256()
@@ -254,16 +266,13 @@ def parse_control_data(data):
 
         if parts[0] == "Priority":
             insert_at = idx
-           
+
     # the table at lib/dpkg/parse.c seems to determine the "correct" order
     # of fields, but we just drop this last.
     lines.append("Status: install ok unpacked\n")
 
     name = _get_dpkg_name(parsed)
-    return (
-        "var/lib/dpkg/info/{}.".format(name),
-        "".join(lines).encode()
-    )
+    return ("var/lib/dpkg/info/{}.".format(name), "".join(lines).encode())
 
 
 def _dpkg_info_files(prefix, control_data, tf):
@@ -281,6 +290,7 @@ def _dpkg_info_files(prefix, control_data, tf):
         member.name = prefix + name
         yield member, file_contents
 
+
 def extract_whole_tar(contents):
     tf = tarfile.open(fileobj=BytesIO(contents))
     ret = dict()
@@ -290,11 +300,13 @@ def extract_whole_tar(contents):
         ret[ti.name] = (ti, file_data)
     return ret
 
+
 def handle_control_tar(contents):
     data = extract_whole_tar(contents)
     control_data = data["./control"][1].decode()
     prefix, new_control_data = parse_control_data(control_data)
     return prefix, _dpkg_info_files(prefix, new_control_data, data.values())
+
 
 def transform_name(name):
     if name == "":
@@ -302,6 +314,7 @@ def transform_name(name):
         return "/.\n"
 
     return "/" + name + "\n"
+
 
 def unpack_ar(fh):
     assert fh.read(8) == b"!<arch>\n"
@@ -418,8 +431,20 @@ class Filesystem:
 
         self._files[ti.name] = (ti, fileobj)
 
+
 def extract_useful(ti):
-    return (ti.name, ti.mode, ti.uid, ti.gid, ti.size, ti.type, ti.uname, ti.gname, ti.pax_headers)
+    return (
+        ti.name,
+        ti.mode,
+        ti.uid,
+        ti.gid,
+        ti.size,
+        ti.type,
+        ti.uname,
+        ti.gname,
+        ti.pax_headers,
+    )
+
 
 def download_files(packages):
     executor = ThreadPoolExecutor(8)
@@ -443,7 +468,7 @@ def download_files(packages):
         try:
             digest = future.result()
         except Exception as exc:
-            print('%r generated an exception: %s' % (name, exc), file=sys.stderr)
+            print("%r generated an exception: %s" % (name, exc), file=sys.stderr)
             continue
 
         if digest != info["SHA256"]:
@@ -463,6 +488,7 @@ def get_unpacked_files(fhs):
     for fh in fhs:
         yield from unpack_ar(fh)
         fh.close()
+
 
 def main():
     print("Evaluating packages to download")
@@ -494,7 +520,6 @@ def main():
         out_fh.flush()
         os.link(out_fh.name, "root.tar.new")
         os.rename("root.tar.new", "root.tar")
-
 
 
 def create_vestigial_files():
@@ -564,12 +589,13 @@ class NullFile:
     def write(buf):
         pass
 
+
 def roundup_block(size):
     blocks = (size + 511) >> 9
     return blocks << 9
 
 
-OutputAction = Enum("OutputAction", 'NOTHING TRUNCATE ALL')
+OutputAction = Enum("OutputAction", "NOTHING TRUNCATE ALL")
 
 
 def mutate_file(fs, ti):
@@ -603,9 +629,9 @@ def output_filter(fs, in_fh, out_fh):
 
         destination = out_fh if output_action is OutputAction.ALL else NullFile
         tarfile.copyfileobj(in_fh, destination, len_to_read)
-            
+
     out_fh.write(NUL * (BLOCKSIZE * 2))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())
