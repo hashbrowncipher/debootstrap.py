@@ -6,21 +6,23 @@ Designed to work anywhere you can run Python and Docker/Podman (e.g. a Mac lapto
 * Tested only with Ubuntu Focal and Jammy
 * Right now LZMA decoding takes up most of the time. Parallelize it? Python's LZMA
   library does release the GIL.
-
+* Needs GPG verification
 
 """
-import ctypes
+import fnmatch
+from http.client import HTTPConnection
 import lzma
 import os
 import random
-import requests
 import re
 import sys
+import tarfile
+import threading
+import time
+from contextlib import closing
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
-from dataclasses import dataclass
-from fnmatch import fnmatch
 from hashlib import sha256
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
@@ -32,38 +34,20 @@ from subprocess import check_output
 from subprocess import PIPE
 from tarfile import TarInfo
 from tempfile import NamedTemporaryFile
+from urllib.parse import urlparse
 from zstandard import ZstdDecompressor
-import shutil
-import tarfile
-
-
-def tarinfo_repr(self):
-    info = dict()
-    for a in self.__slots__:
-        try:
-            info[a] = getattr(self, a)
-        except AttributeError:
-            pass
-    return "TarInfo(**{0:})".format(info)
-
-
-TarInfo.__repr__ = tarinfo_repr
 
 ARCHIVE_URL = "http://archive.ubuntu.com/ubuntu/"
-SUITE = "focal"
-ARCHIVE_SUFFIX = f"dists/{SUITE}/main/binary-amd64/Packages.xz"
+PARSED_ARCHIVE_URL = urlparse(ARCHIVE_URL)
+ARCHIVE_SUFFIX = "dists/{suite}/main/binary-amd64/Packages.xz"
 NUL = b"\0"
 BLOCKSIZE = tarfile.BLOCKSIZE
+CACHE_PATH = Path("debs")
 
-if False:
-    orig_getcomptype = tarfile._StreamProxy.getcomptype
 
-    def getcomptype(self):
-        print(self.buf[:4])
-        if self.buf.startswith(b"\xFD\x2F\xB5\x28"):
-            return "zstd"
-        return orig_getcomptype(self)
-
+def stderr(*args, **kwargs):
+    kwargs["file"] = sys.stderr
+    return print(*args, **kwargs)
 
 @classmethod
 def zstdopen(cls, name, mode="r", fileobj=None, **kwargs):
@@ -74,6 +58,7 @@ def zstdopen(cls, name, mode="r", fileobj=None, **kwargs):
     except:
         fileobj.close()
         raise
+
     t._extfileobj = False
     return t
 
@@ -107,8 +92,8 @@ set -x
 for script in *.preinst; do
   package_fullname="${script//.preinst}"
   package_name="${package_fullname//:*}"
-  DPKG_MAINTSCRIPT_NAME=preinst \
-  DPKG_MAINTSCRIPT_PACKAGE=$package_name \
+  DPKG_MAINTSCRIPT_NAME=preinst \\
+  DPKG_MAINTSCRIPT_PACKAGE=$package_name \\
   ./"$script" install
 done
 
@@ -117,19 +102,16 @@ cd /
 dpkg --configure --force-depends debianutils
 dpkg --configure -a
 
-rm /etc/passwd- /etc/group- /etc/shadow- \
-  /var/cache/debconf/*-old /var/lib/dpkg/*-old \
+rm /etc/passwd- /etc/group- /etc/shadow- \\
+  /var/cache/debconf/*-old /var/lib/dpkg/*-old \\
   /init
 # This cache is not reproducible
 rm /var/cache/ldconfig/aux-cache
 # Some log files (e.g. btmp) need to exist with the right modes, so we truncate them
 # instead of deleting them.
-find /var/log -type f -exec truncate -s0 {} \;
+find /var/log -type f -exec truncate -s0 {} \\;
 """
-
-SECOND_STAGE += (
-    f"echo deb http://archive.ubuntu.com/ubuntu/ {SUITE} main > /etc/apt/sources.list\n"
-)
+ADD_SOURCES_LIST = f"echo deb {ARCHIVE_URL} {{suite}} main > /etc/apt/sources.list\n"
 
 FIELDS = (
     "Package",
@@ -141,7 +123,7 @@ FIELDS = (
     "Pre-Depends",
 )
 FIELDS_MATCHER = re.compile("^({}): (.*)$".format("|".join(FIELDS)))
-
+LOCALE_MATCHER = re.compile(fnmatch.translate("usr/share/locale/*/LC_MESSAGES/*.mo"))
 
 def is_excluded(name):
     if name.startswith("usr/share/doc/"):
@@ -150,7 +132,7 @@ def is_excluded(name):
     if name.startswith("usr/share/man/"):
         return True
 
-    return fnmatch(name, "usr/share/locale/*/LC_MESSAGES/*.mo")
+    return bool(LOCALE_MATCHER.match(name))
 
 
 def packages_dict(packages):
@@ -186,11 +168,15 @@ def get_dependencies(info):
     return ret
 
 
-def get_needed_packages():
-    with requests.get(ARCHIVE_URL + ARCHIVE_SUFFIX, stream=True) as r:
-        r.raise_for_status()
+def get_needed_packages(suite):
+    suffix = ARCHIVE_SUFFIX.format(suite=suite)
+    with closing(HTTPConnection(PARSED_ARCHIVE_URL.netloc)) as c:
+        c.request("GET", PARSED_ARCHIVE_URL.path + suffix)
+        r = c.getresponse()
+        if r.status != 200:
+            raise RuntimeError(r.status)
 
-        with lzma.open(r.raw, "rt") as plain_f:
+        with lzma.open(r, "rt") as plain_f:
             packages_info = packages_dict(plain_f)
 
     required = set()
@@ -216,7 +202,7 @@ def get_needed_packages():
             if dep in unprocessed:
                 continue
 
-            print("Adding dependency {} from {}".format(dep, name), file=sys.stderr)
+            stderr("Adding dependency {} from {}".format(dep, name), file=sys.stderr)
             unprocessed.add(dep)
 
     ret = [packages_info[name] for name in required]
@@ -236,15 +222,23 @@ def copy_file_sha256(src, dst):
     return hasher.hexdigest()
 
 
+threadlocals = threading.local()
+
 def download_file(url, out_fh):
-    with requests.get(url, stream=True) as resp:
-        resp.raise_for_status()
-        return copy_file_sha256(resp.raw, out_fh)
+    try:
+        conn = threadlocals.conn
+    except AttributeError:
+        conn = HTTPConnection(PARSED_ARCHIVE_URL.netloc)
+        threadlocals.conn = conn
+
+    conn.request("GET", url)
+    r = conn.getresponse()
+    if r.status != 200:
+        raise RuntimeError(r.status)
+    return copy_file_sha256(r, out_fh)
 
 
-KNOWN_EXTENSIONS = {".xz", ".gz", ".bz2"}
 WANTED_LINES = set(["Package", "Architecture", "Multi-Arch"])
-
 
 def _get_dpkg_name(control):
     if control.get("Multi-Arch", None) == "same":
@@ -256,19 +250,18 @@ def _get_dpkg_name(control):
 def parse_control_data(data):
     lines = data.splitlines(True)
     parsed = dict()
-    insert_at = 1
     for idx, line in enumerate(lines):
-        parts = line.split(": ")
-        if len(parts) < 2:
+        parts = line.split(": ", 1)
+        if len(parts) != 2:
             continue
-        if parts[0] in WANTED_LINES:
-            parsed[parts[0]] = parts[1].rstrip()
 
-        if parts[0] == "Priority":
-            insert_at = idx
+        k, v = parts
+        if k in WANTED_LINES:
+            parsed[k] = v.rstrip()
 
     # the table at lib/dpkg/parse.c seems to determine the "correct" order
     # of fields, but we just drop this last.
+    # We assume that the next run of dpkg will fix it (it does)
     lines.append("Status: install ok unpacked\n")
 
     name = _get_dpkg_name(parsed)
@@ -321,7 +314,6 @@ def unpack_ar(fh):
     prefix = None
     files = []
     while True:
-        pos = fh.tell()
         header = fh.read(60)
         if not header:
             break
@@ -447,14 +439,15 @@ def extract_useful(ti):
 
 
 def download_files(packages):
+    CACHE_PATH.mkdir(exist_ok=True)
     executor = ThreadPoolExecutor(8)
 
     futures = dict()
     for info in packages:
-        url = ARCHIVE_URL + info["Filename"]
-        destination = Path("debs/" + path.basename(info["Filename"]))
+        url = PARSED_ARCHIVE_URL.path + info["Filename"]
+        destination = CACHE_PATH / Path(info["Filename"]).name
         if destination.exists():
-            print(f"Destination {destination} already exists. Skipping.")
+            stderr(f"Destination {destination} already exists. Skipping.")
             yield destination
             continue
 
@@ -465,17 +458,12 @@ def download_files(packages):
     for future in as_completed(futures):
         info, temp_fh, destination = futures[future]
         name = info["Package"]
-        try:
-            digest = future.result()
-        except Exception as exc:
-            print("%r generated an exception: %s" % (name, exc), file=sys.stderr)
-            continue
-
+        digest = future.result()
         if digest != info["SHA256"]:
             raise RuntimeError("Corrupted download of {}".format(name))
 
         os.link(temp_fh.name, destination)
-        print(f"Downloaded {destination}")
+        stderr(f"Downloaded {destination}")
         yield destination
 
 
@@ -490,67 +478,16 @@ def get_unpacked_files(fhs):
         fh.close()
 
 
-def main():
-    print("Evaluating packages to download")
-    packages = get_needed_packages()
-
-    print("Creating filesystem")
-    deb_paths = download_files(packages)
-    fs = create_filesystem(deb_paths)
-
-    print("Writing image to docker import")
-    docker_import_p = Popen(["docker", "import", "-"], stdin=PIPE, stdout=PIPE)
-    with docker_import_p.stdin as fh:
-        write_image(fs, fh)
-    image_id = docker_import_p.stdout.read().rstrip()
-    ret = docker_import_p.wait()
-    if ret != 0:
-        raise RuntimeError("Couldn't docker import")
-
-    print("Running container for second stage installation")
-    container_id = check_output(["docker", "create", image_id, "/init"]).rstrip()
-    check_call(["docker", "start", "-a", container_id])
-    docker_export_p = Popen(["docker", "export", container_id], stdout=PIPE)
-
-    print("Running docker export and performing output filtering")
-    with NamedTemporaryFile(dir=".") as out_fh:
-        output_filter(fs, docker_export_p.stdout, out_fh)
-        if docker_export_p.wait() != 0:
-            raise RuntimeError("Couldn't docker export")
-        out_fh.flush()
-        os.link(out_fh.name, "root.tar.new")
-        os.rename("root.tar.new", "root.tar")
 
 
-def create_vestigial_files():
-    # Not called.
-    # Debootstrap creates these files, but I haven't found them to be necessary.
-    # ...or something else also creates them
-    fs.mkdir("var/lib/dpkg")
-
-    fs.mkdir("etc")
-
-    fs.mknod("dev/null", 1, 3)
-    fs.mknod("dev/zero", 1, 5)
-    fs.mknod("dev/full", 1, 7)
-    fs.mknod("dev/random", 1, 8)
-    fs.mknod("dev/urandom", 1, 9)
-    fs.mknod("dev/tty", 1, 0)
-    fs.mknod("dev/console", 5, 1)
-    fs.mknod("dev/ptmx", 5, 2)
-
-    fs.mkdir("dev/pts")
-    fs.mkdir("dev/shm")
-
-    fs.symlink("dev/fd", "/proc/self/fd")
-    fs.symlink("dev/stdin", "/proc/self/fd/0")
-    fs.symlink("dev/stdout", "/proc/self/fd/1")
-    fs.symlink("dev/stderr", "/proc/self/fd/2")
-
-
-def create_filesystem(deb_names):
+def create_filesystem(deb_names, add_sources_list: str):
     fs = Filesystem()
-    fs.file("init", SECOND_STAGE, mode=0o755)
+
+    second_stage = SECOND_STAGE
+    if add_sources_list:
+        second_stage += ADD_SOURCES_LIST.format(suite=add_sources_list)
+
+    fs.file("init", second_stage, mode=0o755)
 
     # These files will get created by dpkg as well..mostly.
     # There's a risk that zero packages will install these files.
@@ -566,22 +503,144 @@ def create_filesystem(deb_names):
 
     return fs
 
+def pretty_time(value):
+    if value < 0.001:
+        return "{:.2f} µs".format(value * 1_000_000)
+    if value < 1:
+        return "{:.2f} ms".format(value * 1_000)
+    return "{:.2f} s".format(value)
+
+
+class Timer:
+    value = 0.0
+
+    def __enter__(self):
+        self.value -= time.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        self.value += time.perf_counter()
+
+    @property
+    def fvalue(self):
+        return pretty_time(self.value)
+
+
+def second_stage(image_id):
+    stderr("Running container for second stage installation")
+    container_id = check_output(["docker", "create", image_id, "/init"]).rstrip()
+
+    (r, w) = os.pipe()
+    docker_start_p = Popen(["docker", "start", "-a", container_id], stdout=w, stderr=w)
+    os.close(w)
+    docker_output = []
+    while True:
+        buf = os.read(r, 1024 * 1024)
+        if not buf:
+            break
+
+        docker_output.append(buf)
+    os.close(r)
+
+    retcode = docker_start_p.wait()
+    if retcode != 0:
+        for buf in docker_output:
+            sys.stderr.buffer.write(buf)
+        raise RuntimeError("Container failed")
+
+    return container_id
+
+
+def main():
+    suite = sys.argv[1]
+
+    stderr("Evaluating packages to download")
+    packages = get_needed_packages(suite)
+
+    stderr("Creating filesystem")
+    deb_paths = download_files(packages)
+    fs = create_filesystem(deb_paths, add_sources_list=suite)
+
+    stderr("Writing image to docker import")
+    docker_import_p = Popen(["docker", "import", "-"], stdin=PIPE, stdout=PIPE)
+    with docker_import_p.stdin as fh:
+        hasher = SHA256File(fh)
+        with Timer() as timer:
+            write_image(fs, hasher)
+    timer.value -= hasher.hash_time + hasher.write_time
+    stderr(f"Hashing took {pretty_time(hasher.hash_time)} seconds")
+    stderr(f"Writing took {pretty_time(hasher.write_time)} seconds")
+    stderr(f"Other tasks took {timer.fvalue}")
+
+    stderr("SHA256 sent to docker: " + hasher.hexdigest())
+    image_id = docker_import_p.stdout.read().rstrip()
+    ret = docker_import_p.wait()
+    if ret != 0:
+        raise RuntimeError("Couldn't docker import")
+
+    with Timer() as timer:
+        container_id = second_stage(image_id)
+    stderr(f"Second stage took {timer.fvalue}")
+
+    docker_export_p = Popen(["docker", "export", container_id], stdout=PIPE)
+
+    stderr("Running docker export and performing output filtering")
+    with NamedTemporaryFile(dir=".") as out_fh:
+        hasher = SHA256File(out_fh)
+        output_filter(fs, docker_export_p.stdout, hasher)
+        if docker_export_p.wait() != 0:
+            raise RuntimeError("Couldn't docker export")
+        os.link(out_fh.name, "root.tar.new")
+        os.rename("root.tar.new", "root.tar")
+    print("sha256:" + hasher.hexdigest())
+
+
+class SHA256File:
+    def __init__(self, fh):
+        self._fh = fh
+        self._hasher = sha256()
+        self._hash_timer = Timer()
+        self._write_timer = Timer()
+
+    def write(self, buf):
+        with self._hash_timer:
+            self._hasher.update(buf)
+        with self._write_timer:
+            return self._fh.write(buf)
+
+    def flush(self):
+        self._fh.flush()
+
+    def hexdigest(self):
+        return self._hasher.hexdigest()
+
+    @property
+    def hash_time(self):
+        return self._hash_timer.value
+
+    @property
+    def write_time(self):
+        return self._write_timer.value
+
+
+def write_file(out_fh, info, fh):
+    if not info.isdir() and is_excluded(info.name):
+        return
+
+    out_fh.write(info.tobuf())
+    tarfile.copyfileobj(fh, out_fh, info.size)
+    blocks, remainder = divmod(info.size, BLOCKSIZE)
+    if remainder == 0:
+        return
+    
+    out_fh.write(NUL * (BLOCKSIZE - remainder))
+
 
 def write_image(fs, out_fh):
     files = fs._files
     for name in sorted(files):
-        info, fh = files[name]
-        if not info.isdir() and is_excluded(name):
-            continue
+        write_file(out_fh, *files[name])
 
-        out_fh.write(info.tobuf())
-        if info.size == 0:
-            continue
-
-        tarfile.copyfileobj(fh, out_fh, info.size)
-        blocks, remainder = divmod(info.size, BLOCKSIZE)
-        if remainder > 0:
-            out_fh.write(NUL * (BLOCKSIZE - remainder))
 
 
 class NullFile:
@@ -595,12 +654,9 @@ def roundup_block(size):
     return blocks << 9
 
 
-OutputAction = Enum("OutputAction", "NOTHING TRUNCATE ALL")
-
-
 def mutate_file(fs, ti):
     if ti.name == ".dockerenv":
-        return OutputAction.NOTHING
+        return False
 
     original_entry = fs._files.get(ti.name)
     if original_entry:
@@ -610,7 +666,7 @@ def mutate_file(fs, ti):
     else:
         ti.mtime = 0
 
-    return OutputAction.ALL
+    return True
 
 
 def output_filter(fs, in_fh, out_fh):
@@ -622,15 +678,12 @@ def output_filter(fs, in_fh, out_fh):
             break
 
         len_to_read = roundup_block(ti.size)
-        output_action = mutate_file(fs, ti)
-
-        if output_action is not OutputAction.NOTHING:
-            out_fh.write(ti.tobuf())
-
-        destination = out_fh if output_action is OutputAction.ALL else NullFile
+        destination = out_fh if mutate_file(fs, ti) else NullFile
+        destination.write(ti.tobuf())
         tarfile.copyfileobj(in_fh, destination, len_to_read)
 
     out_fh.write(NUL * (BLOCKSIZE * 2))
+    out_fh.flush()
 
 
 if __name__ == "__main__":
