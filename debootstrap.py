@@ -636,12 +636,13 @@ def output_filter(fs, in_fh, out_fh):
     out_fh.flush()
 
 
-def getresponse(conn):
+def getresponse(conn, path):
+    conn.request("GET", path)
     r = conn.getresponse()
     if r.status != 200:
         raise RuntimeError(r.status)
 
-    return r
+    return r.read()
 
 @dataclass()
 class OSFile:
@@ -758,15 +759,9 @@ def get_sha256sums(release_file):
 def _get_packages(suite):
     dist_path = PARSED_ARCHIVE_URL.path + f"dists/{suite}/"
     with closing(HTTPConnection(PARSED_ARCHIVE_URL.netloc)) as c:
-        release_suffix = dist_path + "Release"
-        c.request("GET", release_suffix)
-        release = getresponse(c).read()
-
-        c.request("GET", dist_path + "Release.gpg")
-        release_gpg = getresponse(c).read()
-
-        c.request("GET", dist_path + "main/binary-amd64/Packages.xz")
-        packages_xz = getresponse(c).read()
+        release = getresponse(c, dist_path + "Release")
+        release_gpg = getresponse(c, dist_path + "Release.gpg")
+        packages_xz = getresponse(c, dist_path + "main/binary-amd64/Packages.xz")
 
     gpg_verify(KEYRING, release_gpg, release)
     sha256sums = get_sha256sums(release)
