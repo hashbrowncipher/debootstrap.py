@@ -5,7 +5,6 @@
   library does release the GIL.
 """
 import fnmatch
-from http.client import HTTPConnection
 import json
 import lzma
 import os
@@ -15,21 +14,20 @@ import sys
 import tarfile
 import threading
 import time
+from concurrent.futures import as_completed
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from contextlib import ExitStack
 from dataclasses import dataclass
-from enum import Enum
-from pathlib import Path
 from hashlib import sha256
+from http.client import HTTPConnection
 from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed
 from os import path
-from subprocess import Popen
-from subprocess import check_call
+from pathlib import Path
 from subprocess import check_output
-from subprocess import PIPE
 from subprocess import DEVNULL
+from subprocess import PIPE
+from subprocess import Popen
 from tarfile import TarInfo
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlparse
@@ -60,7 +58,7 @@ def zstdopen(cls, name, mode="r", fileobj=None, **kwargs):
     fileobj = dctx.stream_reader(fileobj)
     try:
         t = cls.taropen(name, mode, fileobj, **kwargs)
-    except:
+    except:  # noqa: E722
         fileobj.close()
         raise
 
