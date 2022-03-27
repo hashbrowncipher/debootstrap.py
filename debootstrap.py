@@ -33,6 +33,7 @@ from subprocess import DEVNULL
 from tarfile import TarInfo
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlparse
+
 try:
     from zstandard import ZstdDecompressor
 except ModuleNotFoundError:
@@ -47,9 +48,11 @@ GNUPG_PREFIX = b"[GNUPG:] "
 class GPGVNotFoundError(Exception):
     pass
 
+
 def stderr(*args, **kwargs):
     kwargs["file"] = sys.stderr
     return print(*args, **kwargs)
+
 
 @classmethod
 def zstdopen(cls, name, mode="r", fileobj=None, **kwargs):
@@ -126,6 +129,7 @@ FIELDS = (
 )
 FIELDS_MATCHER = re.compile("^({}): (.*)$".format("|".join(FIELDS)))
 LOCALE_MATCHER = re.compile(fnmatch.translate("usr/share/locale/*/LC_MESSAGES/*.mo"))
+
 
 def is_excluded(name):
     if name.startswith("usr/share/doc/"):
@@ -216,6 +220,7 @@ def copy_file_sha256(src, dst):
 
 threadlocals = threading.local()
 
+
 def download_file(netloc, url, out_fh):
     try:
         conn = threadlocals.conn
@@ -231,6 +236,7 @@ def download_file(netloc, url, out_fh):
 
 
 WANTED_LINES = set(["Package", "Architecture", "Multi-Arch"])
+
 
 def _get_dpkg_name(control):
     if control.get("Multi-Arch", None) == "same":
@@ -471,8 +477,6 @@ def get_unpacked_files(fhs):
         fh.close()
 
 
-
-
 def create_filesystem(deb_names, add_sources_list: str):
     fs = Filesystem()
 
@@ -495,6 +499,7 @@ def create_filesystem(deb_names, add_sources_list: str):
         fs.add(member, BytesIO(contents))
 
     return fs
+
 
 def pretty_time(value):
     if value < 0.001:
@@ -581,7 +586,7 @@ def write_file(out_fh, info, fh):
     blocks, remainder = divmod(info.size, BLOCKSIZE)
     if remainder == 0:
         return
-    
+
     out_fh.write(NUL * (BLOCKSIZE - remainder))
 
 
@@ -589,7 +594,6 @@ def write_image(fs, out_fh):
     files = fs._files
     for name in sorted(files):
         write_file(out_fh, *files[name])
-
 
 
 class NullFile:
@@ -643,6 +647,7 @@ def getresponse(conn, path):
 
     return r.read()
 
+
 @dataclass()
 class OSFile:
     fd: int
@@ -685,13 +690,21 @@ def _gpg_verify(keyring, signature, contents):
             s.enter_context(fd)
 
         try:
-            p = Popen([
-                "gpgv", "-q",
-                "--status-fd", "1",
-                "--keyring", f"keyrings/{keyring}.gpg",
-                sig_r.dev_name,
-                cont_r.dev_name,
-            ], pass_fds=(sig_r.fileno(), cont_r.fileno()), stdout=PIPE, stderr=DEVNULL)
+            p = Popen(
+                [
+                    "gpgv",
+                    "-q",
+                    "--status-fd",
+                    "1",
+                    "--keyring",
+                    f"keyrings/{keyring}.gpg",
+                    sig_r.dev_name,
+                    cont_r.dev_name,
+                ],
+                pass_fds=(sig_r.fileno(), cont_r.fileno()),
+                stdout=PIPE,
+                stderr=DEVNULL,
+            )
         except FileNotFoundError as e:
             raise GPGVNotFoundError from e
 
@@ -705,6 +718,7 @@ def _gpg_verify(keyring, signature, contents):
         cont_w.close()
 
     ret = dict()
+
     def good_to_return():
         return b"GOODSIG" in ret and b"VALIDSIG" in ret
 
@@ -714,7 +728,7 @@ def _gpg_verify(keyring, signature, contents):
                 continue
 
             # Trim prefix and newline
-            op = line[len(GNUPG_PREFIX):-1]
+            op = line[len(GNUPG_PREFIX) : -1]
             if op == b"NEWSIG":
                 if good_to_return():
                     return ret
@@ -754,6 +768,7 @@ def get_sha256sums(release_file):
         checksums[filename.decode()] = checksum.decode()
 
     return checksums
+
 
 def _get_packages(keyring, parsed_archive_url, suite):
     dist_path = parsed_archive_url.path + f"dists/{suite}/"
@@ -832,6 +847,7 @@ def build_os(*, keyring, archive_url, suites):
 
 
 def main():
+
     ostype = sys.argv[1]
     if not ostype.isalpha():
         raise RuntimeError(ostype)
