@@ -1,0 +1,8 @@
+{
+  "keyring": "bullseye",
+  "archive_url": "http://deb.debian.org/debian/",
+  "suites": [
+    "bullseye",
+    "bullseye-updates"
+  ]
+}

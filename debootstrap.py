@@ -6,6 +6,7 @@
 """
 import fnmatch
 from http.client import HTTPConnection
+import json
 import lzma
 import os
 import random
@@ -37,9 +38,6 @@ try:
 except ModuleNotFoundError:
     pass
 
-KEYRING = "keyrings/ubuntu.gpg"
-ARCHIVE_URL = "http://archive.ubuntu.com/ubuntu/"
-PARSED_ARCHIVE_URL = urlparse(ARCHIVE_URL)
 NUL = b"\0"
 BLOCKSIZE = tarfile.BLOCKSIZE
 CACHE_PATH = Path("debs")
@@ -115,7 +113,7 @@ rm /var/cache/ldconfig/aux-cache
 # instead of deleting them.
 find /var/log -type f -exec truncate -s0 {} \\;
 """
-ADD_SOURCES_LIST = f"echo deb {ARCHIVE_URL} {{suite}} main >> /etc/apt/sources.list\n"
+ADD_SOURCES_LIST = "echo deb {archive_url} {suite} main >> /etc/apt/sources.list\n"
 
 FIELDS = (
     "Package",
@@ -218,11 +216,11 @@ def copy_file_sha256(src, dst):
 
 threadlocals = threading.local()
 
-def download_file(url, out_fh):
+def download_file(netloc, url, out_fh):
     try:
         conn = threadlocals.conn
     except AttributeError:
-        conn = HTTPConnection(PARSED_ARCHIVE_URL.netloc)
+        conn = HTTPConnection(netloc)
         threadlocals.conn = conn
 
     conn.request("GET", url)
@@ -432,21 +430,22 @@ def extract_useful(ti):
     )
 
 
-def download_files(packages):
+def download_files(parsed_archive_url, packages):
     CACHE_PATH.mkdir(exist_ok=True)
     executor = ThreadPoolExecutor(8)
 
     futures = dict()
     for info in packages:
-        url = PARSED_ARCHIVE_URL.path + info["Filename"]
-        destination = CACHE_PATH / Path(info["Filename"]).name
+        url = parsed_archive_url.path + info["Filename"]
+        destination = CACHE_PATH / Path(parsed_archive_url.netloc + "/" + url)
         if destination.exists():
             stderr(f"Destination {destination} already exists. Skipping.")
             yield destination
             continue
 
+        destination.parent.mkdir(exist_ok=True, parents=True)
         temp_fh = NamedTemporaryFile(dir=destination.parent)
-        fut = executor.submit(download_file, url, temp_fh)
+        fut = executor.submit(download_file, parsed_archive_url.netloc, url, temp_fh)
         futures[fut] = (info, temp_fh, destination)
 
     for future in as_completed(futures):
@@ -478,8 +477,8 @@ def create_filesystem(deb_names, add_sources_list: str):
     fs = Filesystem()
 
     second_stage = SECOND_STAGE
-    for suite in add_sources_list:
-        second_stage += ADD_SOURCES_LIST.format(suite=suite)
+    for info in add_sources_list:
+        second_stage += ADD_SOURCES_LIST.format(**info)
 
     fs.file("init", second_stage, mode=0o755)
 
@@ -689,7 +688,7 @@ def _gpg_verify(keyring, signature, contents):
             p = Popen([
                 "gpgv", "-q",
                 "--status-fd", "1",
-                "--keyring", keyring,
+                "--keyring", f"keyrings/{keyring}.gpg",
                 sig_r.dev_name,
                 cont_r.dev_name,
             ], pass_fds=(sig_r.fileno(), cont_r.fileno()), stdout=PIPE, stderr=DEVNULL)
@@ -756,14 +755,14 @@ def get_sha256sums(release_file):
 
     return checksums
 
-def _get_packages(suite):
-    dist_path = PARSED_ARCHIVE_URL.path + f"dists/{suite}/"
-    with closing(HTTPConnection(PARSED_ARCHIVE_URL.netloc)) as c:
+def _get_packages(keyring, parsed_archive_url, suite):
+    dist_path = parsed_archive_url.path + f"dists/{suite}/"
+    with closing(HTTPConnection(parsed_archive_url.netloc)) as c:
         release = getresponse(c, dist_path + "Release")
         release_gpg = getresponse(c, dist_path + "Release.gpg")
         packages_xz = getresponse(c, dist_path + "main/binary-amd64/Packages.xz")
 
-    gpg_verify(KEYRING, release_gpg, release)
+    gpg_verify(keyring, release_gpg, release)
     sha256sums = get_sha256sums(release)
 
     def repo_verify(path, contents):
@@ -777,25 +776,26 @@ def _get_packages(suite):
     return repo_verify("main/binary-amd64/Packages.xz", packages_xz)
 
 
-def get_packages(suite):
-    contents = _get_packages(suite)
+def get_packages(*args):
+    contents = _get_packages(*args)
     with lzma.open(BytesIO(contents), "rt") as plain_f:
         return packages_dict(plain_f)
 
 
-def main():
-    suites = sys.argv[1:]
+def build_os(*, keyring, archive_url, suites):
+    parsed_archive_url = urlparse(archive_url)
 
     packages = dict()
     for suite in suites:
-        packages.update(get_packages(suite))
+        packages.update(get_packages(keyring, parsed_archive_url, suite))
 
     stderr("Evaluating packages to download")
     packages = get_needed_packages(packages)
 
     stderr("Creating filesystem")
-    deb_paths = download_files(packages)
-    fs = create_filesystem(deb_paths, add_sources_list=suites)
+    deb_paths = download_files(parsed_archive_url, packages)
+    sources_entries = [dict(archive_url=archive_url, suite=suite) for suite in suites]
+    fs = create_filesystem(deb_paths, add_sources_list=sources_entries)
 
     stderr("Writing image to docker import")
     docker_import_p = Popen(["docker", "import", "-"], stdin=PIPE, stdout=PIPE)
@@ -829,6 +829,17 @@ def main():
         os.link(out_fh.name, "root.tar.new")
         os.rename("root.tar.new", "root.tar")
     print("sha256:" + hasher.hexdigest())
+
+
+def main():
+    ostype = sys.argv[1]
+    if not ostype.isalpha():
+        raise RuntimeError(ostype)
+
+    with open(f"definitions/{ostype}.json") as f:
+        kwargs = json.load(f)
+
+    return build_os(**kwargs)
 
 
 if __name__ == "__main__":

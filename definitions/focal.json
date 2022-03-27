@@ -1,0 +1,8 @@
+{
+  "keyring": "ubuntu",
+  "archive_url": "http://archive.ubuntu.com/ubuntu/",
+  "suites": [
+    "focal",
+    "focal-updates"
+  ]
+}
