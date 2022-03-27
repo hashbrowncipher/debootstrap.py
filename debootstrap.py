@@ -3,7 +3,6 @@
 * Tested only with Ubuntu Focal and Jammy
 * Right now LZMA decoding takes up most of the time. Parallelize it? Python's LZMA
   library does release the GIL.
-* TODO: GPG verification
 """
 import fnmatch
 from http.client import HTTPConnection
@@ -16,7 +15,8 @@ import tarfile
 import threading
 import time
 from contextlib import closing
-from contextlib import contextmanager
+from contextlib import ExitStack
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from hashlib import sha256
@@ -28,6 +28,7 @@ from subprocess import Popen
 from subprocess import check_call
 from subprocess import check_output
 from subprocess import PIPE
+from subprocess import DEVNULL
 from tarfile import TarInfo
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlparse
@@ -36,13 +37,17 @@ try:
 except ModuleNotFoundError:
     pass
 
+KEYRING = "keyrings/ubuntu.gpg"
 ARCHIVE_URL = "http://archive.ubuntu.com/ubuntu/"
 PARSED_ARCHIVE_URL = urlparse(ARCHIVE_URL)
-ARCHIVE_SUFFIX = "dists/{suite}/main/binary-amd64/Packages.xz"
 NUL = b"\0"
 BLOCKSIZE = tarfile.BLOCKSIZE
 CACHE_PATH = Path("debs")
+GNUPG_PREFIX = b"[GNUPG:] "
 
+
+class GPGVNotFoundError(Exception):
+    pass
 
 def stderr(*args, **kwargs):
     kwargs["file"] = sys.stderr
@@ -110,7 +115,7 @@ rm /var/cache/ldconfig/aux-cache
 # instead of deleting them.
 find /var/log -type f -exec truncate -s0 {} \\;
 """
-ADD_SOURCES_LIST = f"echo deb {ARCHIVE_URL} {{suite}} main > /etc/apt/sources.list\n"
+ADD_SOURCES_LIST = f"echo deb {ARCHIVE_URL} {{suite}} main >> /etc/apt/sources.list\n"
 
 FIELDS = (
     "Package",
@@ -167,17 +172,7 @@ def get_dependencies(info):
     return ret
 
 
-def get_needed_packages(suite):
-    suffix = ARCHIVE_SUFFIX.format(suite=suite)
-    with closing(HTTPConnection(PARSED_ARCHIVE_URL.netloc)) as c:
-        c.request("GET", PARSED_ARCHIVE_URL.path + suffix)
-        r = c.getresponse()
-        if r.status != 200:
-            raise RuntimeError(r.status)
-
-        with lzma.open(r, "rt") as plain_f:
-            packages_info = packages_dict(plain_f)
-
+def get_needed_packages(packages_info):
     required = set()
     unprocessed = set(
         [k for k, v in packages_info.items() if v["Priority"] == "required"]
@@ -483,8 +478,8 @@ def create_filesystem(deb_names, add_sources_list: str):
     fs = Filesystem()
 
     second_stage = SECOND_STAGE
-    if add_sources_list:
-        second_stage += ADD_SOURCES_LIST.format(suite=add_sources_list)
+    for suite in add_sources_list:
+        second_stage += ADD_SOURCES_LIST.format(suite=suite)
 
     fs.file("init", second_stage, mode=0o755)
 
@@ -548,50 +543,6 @@ def second_stage(image_id):
         raise RuntimeError("Container failed")
 
     return container_id
-
-
-def main():
-    suite = sys.argv[1]
-
-    stderr("Evaluating packages to download")
-    packages = get_needed_packages(suite)
-
-    stderr("Creating filesystem")
-    deb_paths = download_files(packages)
-    fs = create_filesystem(deb_paths, add_sources_list=suite)
-
-    stderr("Writing image to docker import")
-    docker_import_p = Popen(["docker", "import", "-"], stdin=PIPE, stdout=PIPE)
-    with docker_import_p.stdin as fh:
-        hasher = SHA256File(fh)
-        with Timer() as timer:
-            write_image(fs, hasher)
-    timer.value -= hasher.hash_time + hasher.write_time
-    stderr(f"Hashing took {pretty_time(hasher.hash_time)} seconds")
-    stderr(f"Writing took {pretty_time(hasher.write_time)} seconds")
-    stderr(f"Other tasks took {timer.fvalue}")
-
-    stderr("SHA256 sent to docker: " + hasher.hexdigest())
-    image_id = docker_import_p.stdout.read().rstrip()
-    ret = docker_import_p.wait()
-    if ret != 0:
-        raise RuntimeError("Couldn't docker import")
-
-    with Timer() as timer:
-        container_id = second_stage(image_id)
-    stderr(f"Second stage took {timer.fvalue}")
-
-    docker_export_p = Popen(["docker", "export", container_id], stdout=PIPE)
-
-    stderr("Running docker export and performing output filtering")
-    with NamedTemporaryFile(dir=".") as out_fh:
-        hasher = SHA256File(out_fh)
-        output_filter(fs, docker_export_p.stdout, hasher)
-        if docker_export_p.wait() != 0:
-            raise RuntimeError("Couldn't docker export")
-        os.link(out_fh.name, "root.tar.new")
-        os.rename("root.tar.new", "root.tar")
-    print("sha256:" + hasher.hexdigest())
 
 
 class SHA256File:
@@ -683,6 +634,206 @@ def output_filter(fs, in_fh, out_fh):
 
     out_fh.write(NUL * (BLOCKSIZE * 2))
     out_fh.flush()
+
+
+def getresponse(conn):
+    r = conn.getresponse()
+    if r.status != 200:
+        raise RuntimeError(r.status)
+
+    return r
+
+@dataclass()
+class OSFile:
+    fd: int
+    closed: bool = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def fileno(self):
+        return self.fd
+
+    def close(self):
+        if self.closed:
+            return
+
+        os.close(self.fd)
+        self.closed = True
+
+    def write(self, data):
+        os.write(self.fileno(), data)
+
+    @property
+    def dev_name(self):
+        return f"/dev/fd/{self.fd}"
+
+    @classmethod
+    def make_pipe(cls):
+        r, w = os.pipe()
+        return cls(r), cls(w)
+
+
+def _gpg_verify(keyring, signature, contents):
+    sig_r, sig_w = OSFile.make_pipe()
+    cont_r, cont_w = OSFile.make_pipe()
+    with ExitStack() as s:
+        for fd in (sig_r, sig_w, cont_r, cont_w):
+            s.enter_context(fd)
+
+        try:
+            p = Popen([
+                "gpgv", "-q",
+                "--status-fd", "1",
+                "--keyring", keyring,
+                sig_r.dev_name,
+                cont_r.dev_name,
+            ], pass_fds=(sig_r.fileno(), cont_r.fileno()), stdout=PIPE, stderr=DEVNULL)
+        except FileNotFoundError as e:
+            raise GPGVNotFoundError from e
+
+        sig_r.close()
+        cont_r.close()
+
+        sig_w.write(signature)
+        sig_w.close()
+
+        cont_w.write(contents)
+        cont_w.close()
+
+    ret = dict()
+    def good_to_return():
+        return b"GOODSIG" in ret and b"VALIDSIG" in ret
+
+    with p:
+        for line in p.stdout:
+            if not line.startswith(GNUPG_PREFIX):
+                continue
+
+            # Trim prefix and newline
+            op = line[len(GNUPG_PREFIX):-1]
+            if op == b"NEWSIG":
+                if good_to_return():
+                    return ret
+                ret.clear()
+                continue
+
+            opcode, rest = op.split(maxsplit=1)
+            ret[opcode] = rest
+
+        if good_to_return():
+            return ret
+
+
+def gpg_verify(keyring, signature, contents):
+    sig_info = _gpg_verify(keyring, signature, contents)
+    if sig_info is None:
+        raise RuntimeError("gpg validation failed")
+
+    stderr("From GPG:")
+    for key, value in sig_info.items():
+        stderr(f"{key.decode()}: {value.decode()}")
+
+
+def get_sha256sums(release_file):
+    release_file = BytesIO(release_file)
+    checksums = dict()
+
+    for line in release_file:
+        if line == b"SHA256:\n":
+            break
+
+    for line in release_file:
+        if not line.startswith(b" "):
+            break
+
+        checksum, _, filename = line.split()
+        checksums[filename.decode()] = checksum.decode()
+
+    return checksums
+
+def _get_packages(suite):
+    dist_path = PARSED_ARCHIVE_URL.path + f"dists/{suite}/"
+    with closing(HTTPConnection(PARSED_ARCHIVE_URL.netloc)) as c:
+        release_suffix = dist_path + "Release"
+        c.request("GET", release_suffix)
+        release = getresponse(c).read()
+
+        c.request("GET", dist_path + "Release.gpg")
+        release_gpg = getresponse(c).read()
+
+        c.request("GET", dist_path + "main/binary-amd64/Packages.xz")
+        packages_xz = getresponse(c).read()
+
+    gpg_verify(KEYRING, release_gpg, release)
+    sha256sums = get_sha256sums(release)
+
+    def repo_verify(path, contents):
+        expected_checksum = sha256sums[path]
+        actual_checksum = sha256(contents).hexdigest()
+        if expected_checksum != actual_checksum:
+            raise RuntimeError(expected_checksum, actual_checksum)
+
+        return contents
+
+    return repo_verify("main/binary-amd64/Packages.xz", packages_xz)
+
+
+def get_packages(suite):
+    contents = _get_packages(suite)
+    with lzma.open(BytesIO(contents), "rt") as plain_f:
+        return packages_dict(plain_f)
+
+
+def main():
+    suites = sys.argv[1:]
+
+    packages = dict()
+    for suite in suites:
+        packages.update(get_packages(suite))
+
+    stderr("Evaluating packages to download")
+    packages = get_needed_packages(packages)
+
+    stderr("Creating filesystem")
+    deb_paths = download_files(packages)
+    fs = create_filesystem(deb_paths, add_sources_list=suites)
+
+    stderr("Writing image to docker import")
+    docker_import_p = Popen(["docker", "import", "-"], stdin=PIPE, stdout=PIPE)
+    with docker_import_p.stdin as fh:
+        hasher = SHA256File(fh)
+        with Timer() as timer:
+            write_image(fs, hasher)
+    timer.value -= hasher.hash_time + hasher.write_time
+    stderr(f"Hashing took {pretty_time(hasher.hash_time)} seconds")
+    stderr(f"Writing took {pretty_time(hasher.write_time)} seconds")
+    stderr(f"Other tasks took {timer.fvalue}")
+
+    stderr("SHA256 sent to docker: " + hasher.hexdigest())
+    image_id = docker_import_p.stdout.read().rstrip()
+    ret = docker_import_p.wait()
+    if ret != 0:
+        raise RuntimeError("Couldn't docker import")
+
+    with Timer() as timer:
+        container_id = second_stage(image_id)
+    stderr(f"Second stage took {timer.fvalue}")
+
+    docker_export_p = Popen(["docker", "export", container_id], stdout=PIPE)
+
+    stderr("Running docker export and performing output filtering")
+    with NamedTemporaryFile(dir=".") as out_fh:
+        hasher = SHA256File(out_fh)
+        output_filter(fs, docker_export_p.stdout, hasher)
+        if docker_export_p.wait() != 0:
+            raise RuntimeError("Couldn't docker export")
+        os.link(out_fh.name, "root.tar.new")
+        os.rename("root.tar.new", "root.tar")
+    print("sha256:" + hasher.hexdigest())
 
 
 if __name__ == "__main__":
