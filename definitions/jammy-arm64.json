@@ -1,0 +1,9 @@
+{
+  "keyring": "ubuntu",
+  "archive_url": "http://ports.ubuntu.com/ubuntu-ports/",
+  "suites": [
+    "jammy",
+    "jammy-updates"
+  ],
+  "architecture": "arm64"
+}

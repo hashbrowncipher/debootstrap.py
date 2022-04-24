@@ -1,0 +1,7 @@
+{
+  "keyring": "sid",
+  "archive_url": "http://deb.debian.org/debian/",
+  "suites": [
+    "sid"
+  ]
+}

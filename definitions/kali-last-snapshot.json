@@ -1,0 +1,7 @@
+{
+  "keyring": "kali",
+  "archive_url": "http://http.kali.org/kali/",
+  "suites": [
+    "kali-last-snapshot"
+  ]
+}

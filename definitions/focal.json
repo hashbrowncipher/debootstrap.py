@@ -4,5 +4,6 @@
   "suites": [
     "focal",
     "focal-updates"
-  ]
+  ],
+  "architecture": "amd64"
 }

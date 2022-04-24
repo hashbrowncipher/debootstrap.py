@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-* Tested only with Ubuntu Focal and Jammy
 * Right now LZMA decoding takes up most of the time. Parallelize it? Python's LZMA
   library does release the GIL.
 """
 import fnmatch
 import json
+import gzip
 import lzma
 import os
 import random
@@ -14,13 +14,16 @@ import sys
 import tarfile
 import threading
 import time
+from argparse import ArgumentParser
 from concurrent.futures import as_completed
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import contextmanager
 from contextlib import ExitStack
 from dataclasses import dataclass
 from hashlib import sha256
 from http.client import HTTPConnection
+from http.client import RemoteDisconnected
+from http.cookiejar import http2time
 from io import BytesIO
 from os import path
 from pathlib import Path
@@ -31,6 +34,7 @@ from subprocess import Popen
 from tarfile import TarInfo
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlparse
+from wsgiref.handlers import format_date_time
 
 try:
     from zstandard import ZstdDecompressor
@@ -41,6 +45,7 @@ NUL = b"\0"
 BLOCKSIZE = tarfile.BLOCKSIZE
 CACHE_PATH = Path("debs")
 GNUPG_PREFIX = b"[GNUPG:] "
+PACKAGES_PREFERENCE = {".xz": lzma.open, ".gz": gzip.open, "": lambda f, mode: f}
 
 
 class GPGVNotFoundError(Exception):
@@ -70,8 +75,7 @@ tarfile.TarFile.zstdopen = zstdopen
 tarfile.TarFile.OPEN_METH["zstd"] = "zstdopen"
 
 
-SECOND_STAGE = """\
-#!/bin/bash
+SECOND_STAGE = r"""#!/bin/bash
 set -e
 
 cat << EOF > /usr/bin/policy-rc.d
@@ -95,8 +99,8 @@ set -x
 for script in *.preinst; do
   package_fullname="${script//.preinst}"
   package_name="${package_fullname//:*}"
-  DPKG_MAINTSCRIPT_NAME=preinst \\
-  DPKG_MAINTSCRIPT_PACKAGE=$package_name \\
+  DPKG_MAINTSCRIPT_NAME=preinst \
+  DPKG_MAINTSCRIPT_PACKAGE=$package_name \
   ./"$script" install
 done
 
@@ -105,16 +109,36 @@ cd /
 dpkg --configure --force-depends debianutils
 dpkg --configure -a
 
-rm /etc/passwd- /etc/group- /etc/shadow- \\
-  /var/cache/debconf/*-old /var/lib/dpkg/*-old \\
+rm /etc/passwd- /etc/group- /etc/shadow- \
+  /var/cache/debconf/*-old /var/lib/dpkg/*-old \
   /init
 # This cache is not reproducible
 rm /var/cache/ldconfig/aux-cache
 # Some log files (e.g. btmp) need to exist with the right modes, so we truncate them
 # instead of deleting them.
-find /var/log -type f -exec truncate -s0 {} \\;
+find /var/log -type f -exec truncate -s0 {} \;
 """
 ADD_SOURCES_LIST = "echo deb {archive_url} {suite} main >> /etc/apt/sources.list\n"
+
+THIRD_STAGE = r"""
+# Make suitable for VM use
+passwd -d root
+ln -s /lib/systemd/systemd /sbin/init
+ln -s /lib/systemd/system/systemd-networkd.service \
+    /etc/systemd/system/multi-user.target.wants/systemd-networkd.service
+
+cat << EOF > /etc/systemd/network/ens.network
+[Match]
+Name=!lo*
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+UseHostname=no
+EOF
+"""
+
 
 FIELDS = (
     "Package",
@@ -180,6 +204,11 @@ def get_needed_packages(packages_info):
     unprocessed.add("apt")
     unprocessed.add("gpgv")
 
+    # VM dependencies
+    unprocessed.add("systemd")
+    unprocessed.add("linux-image-virtual")
+    unprocessed.add("udev")
+
     while unprocessed:
         name = unprocessed.pop()
 
@@ -220,16 +249,10 @@ threadlocals = threading.local()
 
 
 def download_file(netloc, url, out_fh):
-    try:
-        conn = threadlocals.conn
-    except AttributeError:
-        conn = HTTPConnection(netloc)
-        threadlocals.conn = conn
-
-    conn.request("GET", url)
-    r = conn.getresponse()
+    r = fetch_http(netloc, url)
     if r.status != 200:
         raise RuntimeError(r.status)
+
     return copy_file_sha256(r, out_fh)
 
 
@@ -435,7 +458,6 @@ def extract_useful(ti):
 
 
 def download_files(parsed_archive_url, packages):
-    CACHE_PATH.mkdir(exist_ok=True)
     executor = ThreadPoolExecutor(8)
 
     futures = dict()
@@ -482,6 +504,8 @@ def create_filesystem(deb_names, add_sources_list: str):
     for info in add_sources_list:
         second_stage += ADD_SOURCES_LIST.format(**info)
 
+    second_stage += THIRD_STAGE
+
     fs.file("init", second_stage, mode=0o755)
 
     # These files will get created by dpkg as well..mostly.
@@ -524,7 +548,7 @@ class Timer:
 
 def second_stage(image_id):
     stderr("Running container for second stage installation")
-    container_id = check_output(["docker", "create", image_id, "/init"]).rstrip()
+    container_id = check_output(["docker", "create", "--net=none", image_id, "/init"]).rstrip()
 
     (r, w) = os.pipe()
     docker_start_p = Popen(["docker", "start", "-a", container_id], stdout=w, stderr=w)
@@ -565,6 +589,9 @@ class SHA256File:
 
     def hexdigest(self):
         return self._hasher.hexdigest()
+
+    def close(self):
+        self._fh.close()
 
     @property
     def hash_time(self):
@@ -609,6 +636,11 @@ def mutate_file(fs, ti):
     if ti.name == ".dockerenv":
         return False
 
+    if ti.name == "etc/resolv.conf":
+        # Docker leaves this in even though we specify --net=none
+        # I hate Docker
+        return False
+
     original_entry = fs._files.get(ti.name)
     if original_entry:
         original_mtime = original_entry[0].mtime
@@ -632,6 +664,11 @@ def output_filter(fs, in_fh, out_fh):
         destination = out_fh if mutate_file(fs, ti) else NullFile
         destination.write(ti.tobuf())
         tarfile.copyfileobj(in_fh, destination, len_to_read)
+
+    ti = TarInfo("etc/resolv.conf")
+    ti.type = tarfile.SYMTYPE
+    ti.linkname = "/run/systemd/resolve/stub-resolv.conf"
+    out_fh.write(ti.tobuf())
 
     out_fh.write(NUL * (BLOCKSIZE * 2))
     out_fh.flush()
@@ -740,12 +777,12 @@ def _gpg_verify(keyring, signature, contents):
             return ret
 
 
-def gpg_verify(keyring, signature, contents):
+def gpg_verify(keyring, name, signature, contents):
     sig_info = _gpg_verify(keyring, signature, contents)
     if sig_info is None:
         raise RuntimeError("gpg validation failed")
 
-    stderr("From GPG:")
+    stderr(f"From GPG for '{name}':")
     for key, value in sig_info.items():
         stderr(f"{key.decode()}: {value.decode()}")
 
@@ -768,42 +805,128 @@ def get_sha256sums(release_file):
     return checksums
 
 
-def _get_packages(keyring, parsed_archive_url, suite):
-    dist_path = parsed_archive_url.path + f"dists/{suite}/"
-    with closing(HTTPConnection(parsed_archive_url.netloc)) as c:
-        release = getresponse(c, dist_path + "Release")
-        release_gpg = getresponse(c, dist_path + "Release.gpg")
-        packages_xz = getresponse(c, dist_path + "main/binary-amd64/Packages.xz")
+def fetch_http(netloc, path, follow_redirects=1, **kwargs):
+    try:
+        conns = threadlocals.conns
+    except AttributeError:
+        conns = dict()
+        threadlocals.conns = conns
 
-    gpg_verify(keyring, release_gpg, release)
+    while True:
+        try:
+            conn = conns[netloc]
+        except KeyError:
+            conn = HTTPConnection(netloc)
+            conns[netloc] = conn
+
+        conn.request("GET", path, **kwargs)
+
+        try:
+            r = conn.getresponse()
+        except RemoteDisconnected:
+            pass
+        else:
+            break
+
+    if r.status == 302 and follow_redirects > 0:
+        r.read()
+        parsed = urlparse(r.headers["Location"])
+        return fetch_http(parsed.netloc, parsed.path, follow_redirects - 1, **kwargs)
+
+    return r
+
+
+def download_cached(netloc, path):
+    destination = CACHE_PATH / (netloc + path)
+    try:
+        stat = destination.stat()
+    except FileNotFoundError:
+        stat = None
+
+    headers = dict()
+    if stat:
+        headers["If-Modified-Since"] = format_date_time(stat.st_mtime)
+
+    r = fetch_http(netloc, path, headers=headers)
+    stderr(f"HTTP {r.status} for {netloc}{path}")
+    if r.status == 304:
+        r.read()
+        return destination.read_bytes()
+
+    if r.status != 200:
+        raise RuntimeError(r.status)
+
+    ret = r.read()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(ret)
+    mtime = int(http2time(r.headers["Date"]))
+    os.utime(destination, (mtime, mtime))
+    return ret
+
+
+def get_release_fetcher(keyring, netloc, dist_path):
+    name = dist_path + "Release"
+    cache_path = CACHE_PATH / netloc / dist_path
+
+    release = download_cached(netloc, name)
+    release_gpg = download_cached(netloc, dist_path + "Release.gpg")
+    gpg_verify(keyring, name, release_gpg, release)
+
     sha256sums = get_sha256sums(release)
 
-    def repo_verify(path, contents):
+    def repo_fetch(path):
         expected_checksum = sha256sums[path]
+        contents = download_cached(netloc, dist_path + path)
         actual_checksum = sha256(contents).hexdigest()
+
         if expected_checksum != actual_checksum:
             raise RuntimeError(expected_checksum, actual_checksum)
 
         return contents
 
-    return repo_verify("main/binary-amd64/Packages.xz", packages_xz)
+    return repo_fetch
+
+
+
+def _get_packages(architecture, keyring, parsed_archive_url, suite):
+    url = (parsed_archive_url.netloc, parsed_archive_url.path + f"dists/{suite}/")
+
+    repo_fetch = get_release_fetcher(keyring, *url)
+    for pref in PACKAGES_PREFERENCE:
+        try:
+            return pref, repo_fetch(f"main/binary-{architecture}/Packages{pref}")
+        except KeyError:
+            pass
+
 
 
 def get_packages(*args):
-    contents = _get_packages(*args)
-    with lzma.open(BytesIO(contents), "rt") as plain_f:
+    pref, contents = _get_packages(*args)
+    opener = PACKAGES_PREFERENCE[pref]
+
+    with opener(BytesIO(contents), "rt") as plain_f:
         return packages_dict(plain_f)
 
 
-def build_os(*, keyring, archive_url, suites):
-    parsed_archive_url = urlparse(archive_url)
+def get_all_packages_info(architecture, keyring, parsed_archive_url, suites):
+    futs = []
+    with ThreadPoolExecutor() as executor:
+        for suite in suites:
+            futs.append(executor.submit(get_packages, architecture, keyring, parsed_archive_url, suite))
 
-    packages = dict()
-    for suite in suites:
-        packages.update(get_packages(keyring, parsed_archive_url, suite))
+    ret = dict()
+    for fut in futs:
+        ret.update(fut.result())
+
+    return ret
+
+
+def build_os(*, architecture, keyring, archive_url, suites):
+    parsed_archive_url = urlparse(archive_url)
+    packages_info = get_all_packages_info(architecture, keyring, parsed_archive_url, suites)
 
     stderr("Evaluating packages to download")
-    packages = get_needed_packages(packages)
+    packages = get_needed_packages(packages_info)
 
     stderr("Creating filesystem")
     deb_paths = download_files(parsed_archive_url, packages)
@@ -845,14 +968,14 @@ def build_os(*, keyring, archive_url, suites):
 
 
 def main():
-
     ostype = sys.argv[1]
-    if not ostype.isalpha():
+    if "." in ostype or "/" in ostype:
         raise RuntimeError(ostype)
 
     with open(f"definitions/{ostype}.json") as f:
         kwargs = json.load(f)
 
+    kwargs.setdefault("architecture", "amd64")
     return build_os(**kwargs)
 
 
