@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from enum import Enum
 from os.path import join
 
+from os import SEEK_END
+
 from lz4 import LZ4Compressor, LZ4Decompressor
 from zstd import ZstdCompressor
 
@@ -41,13 +43,13 @@ FILE_TYPES = {
     12: FileType.SOCKET,
 }
 
-i16 = ctypes.c_int16.__ctype_le__
-u16 = ctypes.c_uint16.__ctype_le__
-u32 = ctypes.c_uint32.__ctype_le__
-u64 = ctypes.c_uint64.__ctype_le__
+i16 = ctypes.c_int16.__ctype_be__
+u16 = ctypes.c_uint16.__ctype_be__
+u32 = ctypes.c_uint32.__ctype_be__
+u64 = ctypes.c_uint64.__ctype_be__
 u8 = ctypes.c_ubyte
 u1 = ctypes.c_bool
-struct = ctypes.LittleEndianStructure
+struct = ctypes.BigEndianStructure
 
 
 # FIT: fixed inode table
@@ -101,16 +103,32 @@ class FDTEntry(struct):
     def __len__(self):
         return ctypes.sizeof(self) + len(self.name)
 
+    def __repr__(self):
+        return "{}(dir_inode={}, name={}, inode={})".format(
+            self.__class__.__name__, self.dir_inode, self.name, self.inode
+        )
+
 
 # I would have called them "index nodes"
 # but that would make them inodes, which would be even more confusing
 class TreeNode(struct):
     _fields_ = [
-        ("span", u64)
+        ("span", u64),
         # FIXME: consider making this a u16 and just having all blocks be an even number
-        # of bytes?
+        # of bytes smaller than 131072?
         ("size", u32),
     ]
+
+    @classmethod
+    def create(cls, span, size, pk):
+        ret = cls(span, size)
+        ret.pk = pk
+        return ret
+
+    def __repr__(self):
+        return "{}(span={}, size={}, pk={})".format(
+            self.__class__.__name__, self.span, self.size, self.pk
+        )
 
 
 @dataclass(frozen=True, order=True)
@@ -209,7 +227,6 @@ def produce_output_mapping(inodes, dentries) -> tuple[list[HostINode], list]:
 
     archive_dentries.sort()
     archive_inodes = [inode for (inode, _) in inodes_mapping]
-    print(archive_dentries[0])
 
     return archive_inodes, archive_dentries
 
@@ -229,15 +246,13 @@ class NoOpCompressor:
 
 
 def _compress_dentry_block(block):
-    compressed = LZ4Compressor().compress_block(block)
-    ret = bytes(ctypes.c_uint16(len(compressed))) + compressed
+    ret = NoOpCompressor().compress_block(block)
     return ret
 
 
-def _uncompress_dentry_block(fh):
-    size = ctypes.c_uint16()
-    assert fh.readinto(size) == 2
-    return LZ4Decompressor().decompress_block(fh.read(size.value))
+def _uncompress_dentry_block(fh, size):
+    buf = fh.read(size)
+    return NoOpCompressor().decompress_block(buf)
 
 
 def _test_dentry_compression():
@@ -245,10 +260,10 @@ def _test_dentry_compression():
         in_bytes = b"\x00" * i
         compressed = _compress_dentry_block(in_bytes)
         fh = io.BytesIO(compressed)
-        fh.seek(0, 2)
+        fh.seek(0, SEEK_END)
         fh.write(b"\x00" * 20)
         fh.seek(0)
-        back = _uncompress_dentry_block(fh)
+        back = _uncompress_dentry_block(fh, len(compressed))
         assert in_bytes == back
 
 
@@ -276,12 +291,17 @@ def write_fdt_block(dentries):
         if bytes_avail <= 0:
             dentries.append(dentry)
 
+        print(last)
         uncompressed.write(last)
         names.append(last.name)
         count += 1
 
     if count == 0:
         return None
+
+    common_prefix = _shared_prefix(first.pk, last.pk)
+    print("Prefix: ", common_prefix)
+    # TODO: do something with this information
 
     ret = bytes([ctypes.c_uint8(count).value])
     ret += transform_block(uncompressed.getvalue(), ctypes.sizeof(FDTEntry))
@@ -294,6 +314,11 @@ def write_fdt_block(dentries):
 
 
 def _compute_break(last, first):
+    """Find a 'break' point that distinguishes two strings.
+
+    Instead of storing full PKs, we can chop off any portion of the PK that doesn't
+    distinguish from the previous block.
+    """
     while not last.startswith(first):
         # very inefficient
         first, removed = first[:-1], first[-1]
@@ -306,7 +331,25 @@ def test_compute_break():
     assert _compute_break(b"test.10681", b"test.1069abcde") == b"test.1069"
 
 
+def _shared_prefix(xs, ys):
+    i = 0
+    for (x, y) in zip(xs, ys):
+        if x != y:
+            break
+
+        i += 1
+
+    return xs[:i]
+
+
+def test_shared_prefix():
+    assert _shared_prefix("foobar", "foobaz") == "fooba"
+    assert _shared_prefix("foobar", "") == ""
+    assert _shared_prefix("foobar", "foo") == "foo"
+
+
 test_compute_break()
+test_shared_prefix()
 
 
 def create_fdt_index_chunk(chunks_it, lengths_it):
@@ -323,6 +366,7 @@ def create_fdt_index_chunk(chunks_it, lengths_it):
         chunk_length = next(lengths_it)
         total_length += chunk_length
         lengths[i] = chunk_length
+        print("FDTIndex(pk={}, size={})".format(entries[i], chunk_length))
 
     total_length += next(lengths_it)
     break_chunk = None
@@ -333,16 +377,14 @@ def create_fdt_index_chunk(chunks_it, lengths_it):
 
     break_at = _compute_break(*break_chunk) if break_chunk else None
 
-    print("Break", break_at, total_length)
-
     buf = bytes(lengths)
     buf = transform_block(buf, 8)
     fh = io.BytesIO(buf)
-    fh.seek(0, 2)
+    fh.seek(0, SEEK_END)
     for entry in entries:
         fh.write(entry)
 
-    return _compress_dentry_block(fh.getvalue())
+    return _compress_dentry_block(fh.getvalue()), total_length, break_at
 
 
 def write_fdt(out, dentries):
@@ -360,11 +402,16 @@ def write_fdt(out, dentries):
 
     chunks_it = zip(lasts, firsts[1:])
     lengths_it = iter(lengths)
+    nodes = []
     while chunk := create_fdt_index_chunk(chunks_it, lengths_it):
-        buf = chunk
-        print(buf)
+        buf, span, break_at = chunk
+        nodes.append(TreeNode.create(span, len(buf), break_at))
         out.write(buf)
-    print((lasts[-1], lengths[-1]))
+
+    # TODO: recursively build treenodes until they all fit in a single node
+    # Store the tree height in the superblock
+    for node in nodes:
+        print(node)
 
 
 def delta_encode(buf):
