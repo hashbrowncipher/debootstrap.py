@@ -75,7 +75,6 @@ find /var/log -type f -exec truncate -s0 {} \;
 ADD_SOURCES_LIST = "echo deb {archive_url} {suite} main >> /etc/apt/sources.list\n"
 
 
-
 def _get_dpkg_name(control):
     if control.get("Multi-Arch", None) == "same":
         return "{}:{}".format(control["Package"], control["Architecture"])
@@ -356,5 +355,6 @@ def main():
     with outfile.open("wb") as out_fh:
         fs.write(out_fh)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     raise SystemExit(main())

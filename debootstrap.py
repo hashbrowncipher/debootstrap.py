@@ -13,10 +13,8 @@ import sys
 import tarfile
 import threading
 import time
-from argparse import ArgumentParser
 from concurrent.futures import as_completed
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from contextlib import ExitStack
 from dataclasses import dataclass
 from hashlib import sha256
@@ -24,7 +22,6 @@ from http.client import HTTPConnection
 from http.client import RemoteDisconnected
 from http.cookiejar import http2time
 from io import BytesIO
-from os import path
 from pathlib import Path
 from subprocess import check_output
 from subprocess import DEVNULL
@@ -62,7 +59,6 @@ EOF
 """
 
 
-
 class GPGVNotFoundError(Exception):
     pass
 
@@ -82,7 +78,6 @@ FIELDS = (
     "Pre-Depends",
 )
 FIELDS_MATCHER = re.compile("^({}): (.*)$".format("|".join(FIELDS)))
-
 
 
 def packages_dict(packages):
@@ -166,7 +161,9 @@ def copy_file_sha256(src, dst):
     dst.flush()
     return hasher.hexdigest()
 
+
 threadlocals = threading.local()
+
 
 def download_file(netloc, url, out_fh):
     r = fetch_http(netloc, url)
@@ -174,6 +171,7 @@ def download_file(netloc, url, out_fh):
         raise RuntimeError(r.status)
 
     return copy_file_sha256(r, out_fh)
+
 
 def download_files(parsed_archive_url, packages):
     executor = ThreadPoolExecutor(8)
@@ -203,6 +201,7 @@ def download_files(parsed_archive_url, packages):
         stderr(f"Downloaded {destination}")
         yield destination
 
+
 def pretty_time(value):
     if value < 0.001:
         return "{:.2f} µs".format(value * 1_000_000)
@@ -228,7 +227,9 @@ class Timer:
 
 def second_stage(image_id):
     stderr("Running container for second stage installation")
-    container_id = check_output(["docker", "create", "--net=none", image_id, "/init"]).rstrip()
+    container_id = check_output(
+        ["docker", "create", "--net=none", image_id, "/init"]
+    ).rstrip()
 
     (r, w) = os.pipe()
     docker_start_p = Popen(["docker", "start", "-a", container_id], stdout=w, stderr=w)
@@ -280,7 +281,6 @@ class SHA256File:
     @property
     def write_time(self):
         return self._write_timer.value
-
 
 
 class NullFile:
@@ -527,7 +527,6 @@ def download_cached(netloc, path):
 
 def get_release_fetcher(keyring, netloc, dist_path):
     name = dist_path + "Release"
-    cache_path = CACHE_PATH / netloc / dist_path
 
     release = download_cached(netloc, name)
     release_gpg = download_cached(netloc, dist_path + "Release.gpg")
@@ -548,7 +547,6 @@ def get_release_fetcher(keyring, netloc, dist_path):
     return repo_fetch
 
 
-
 def _get_packages(architecture, keyring, parsed_archive_url, suite):
     url = (parsed_archive_url.netloc, parsed_archive_url.path + f"dists/{suite}/")
 
@@ -558,7 +556,6 @@ def _get_packages(architecture, keyring, parsed_archive_url, suite):
             return pref, repo_fetch(f"main/binary-{architecture}/Packages{pref}")
         except KeyError:
             pass
-
 
 
 def get_packages(*args):
@@ -573,7 +570,11 @@ def get_all_packages_info(architecture, keyring, parsed_archive_url, suites):
     futs = []
     with ThreadPoolExecutor() as executor:
         for suite in suites:
-            futs.append(executor.submit(get_packages, architecture, keyring, parsed_archive_url, suite))
+            futs.append(
+                executor.submit(
+                    get_packages, architecture, keyring, parsed_archive_url, suite
+                )
+            )
 
     ret = dict()
     for fut in futs:
@@ -584,7 +585,9 @@ def get_all_packages_info(architecture, keyring, parsed_archive_url, suites):
 
 def build_os(*, architecture, keyring, archive_url, suites):
     parsed_archive_url = urlparse(archive_url)
-    packages_info = get_all_packages_info(architecture, keyring, parsed_archive_url, suites)
+    packages_info = get_all_packages_info(
+        architecture, keyring, parsed_archive_url, suites
+    )
 
     stderr("Evaluating packages to download")
     packages = get_needed_packages(packages_info)
@@ -592,7 +595,9 @@ def build_os(*, architecture, keyring, archive_url, suites):
     stderr("Creating filesystem")
     deb_paths = download_files(parsed_archive_url, packages)
     sources_entries = [dict(archive_url=archive_url, suite=suite) for suite in suites]
-    fs = create_filesystem(deb_paths, add_sources_list=sources_entries, third_stage=THIRD_STAGE)
+    fs = create_filesystem(
+        deb_paths, add_sources_list=sources_entries, third_stage=THIRD_STAGE
+    )
 
     stderr("Writing image to docker import")
     docker_import_p = Popen(["docker", "import", "-"], stdin=PIPE, stdout=PIPE)
