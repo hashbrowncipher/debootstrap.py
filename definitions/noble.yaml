@@ -1,0 +1,11 @@
+---
+keyring: ubuntu
+archive_url: http://archive.ubuntu.com/ubuntu/
+suites:
+- noble
+- noble-updates
+pre_link:
+  bin: /usr/bin
+  lib: /usr/lib
+  lib64: /usr/lib64
+  sbin: /usr/sbin

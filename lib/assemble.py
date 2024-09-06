@@ -65,7 +65,7 @@ dpkg --configure -a
 
 rm /etc/passwd- /etc/group- /etc/shadow- \
   /var/cache/debconf/*-old /var/lib/dpkg/*-old \
-  /init
+  /init /etc/machine-id
 # This cache is not reproducible
 rm /var/cache/ldconfig/aux-cache
 # Some log files (e.g. btmp) need to exist with the right modes, so we truncate them
@@ -143,7 +143,6 @@ def get_debs_from_directory(paths):
 def extract_useful(ti):
     return (
         ti.name,
-        ti.mode,
         ti.uid,
         ti.gid,
         ti.size,
@@ -188,45 +187,62 @@ class Filesystem:
         ti.devminor = minor
         self.add(ti)
 
-    def resolve(self, name):
-        try:
-            entry = self._files[name]
-        except KeyError:
-            return name
+    def _resolve(self, components):
+        name = ""
+        for c in components:
+            name = path.normpath(path.join(name, c))
 
-        info, fh = entry
-        if not info.issym():
-            return name
+            try:
+                entry = self._files[name]
+            except KeyError:
+                continue
 
-        dirname = path.dirname(name)
-        target = path.normpath(path.join(dirname, info.linkname))
-        return self.resolve(target)
+            info, fh = entry
+            if not info.issym():
+                continue
+
+            dirname = path.dirname(name)
+            name = path.join(dirname, info.linkname)
+            name = path.normpath(name).lstrip("/")
+
+        return name
 
     def _build_path(self, name):
-        ret = ""
-        components = name.split("/")[::-1]
-        while components:
-            c = components.pop()
-            ret = self.resolve(path.join(ret, c))
-
-        return ret
+        components = name.lstrip("/").split("/")
+        return self._resolve(components)
 
     def add(self, ti, fileobj=None):
-        ti.name = self._build_path(ti.name)
+        bname = path.basename(ti.name)
+        parent = self._build_path(path.dirname(ti.name))
+        if parent == ".":
+            ti.name = bname
+        else:
+            if parent not in self._files:
+                self.mkdir(parent)
+            ti.name = f"{parent}/{bname}"
+
         ti.uname = ""
         ti.gname = ""
 
         if ti.name in self._files:
             existing, _ = self._files[ti.name]
-            existing.mtime = max(existing.mtime, ti.mtime)
+            if existing.type == ti.type:
+                existing.mtime = max(existing.mtime, ti.mtime)
+                existing.mode |= ti.mode
 
             if extract_useful(ti) != extract_useful(existing):
+                if (existing.type == tarfile.SYMTYPE and ti.type == tarfile.DIRTYPE):
+                    return
+
                 raise RuntimeError(ti.name)
 
             return
 
         if ti.name == "":
             return
+
+        if ti.name.startswith("/"):
+            raise Exception(ti.name)
 
         self._files[ti.name] = (ti, fileobj)
 
@@ -284,7 +300,6 @@ def split_tar_namemode(name: bytes):
     return root, mode
 
 
-
 def unpack_ar(fh):
     assert fh.read(8) == b"!<arch>\n"
     prefix = None
@@ -334,7 +349,12 @@ def get_unpacked_files(fhs):
         fh.close()
 
 
-def create_filesystem(deb_names, add_sources_list: str, third_stage: str = ""):
+def create_filesystem(
+    deb_names,
+    add_sources_list: str,
+    pre_link: dict[str, str] = None,
+    third_stage: str = "",
+):
     fs = Filesystem()
 
     second_stage = SECOND_STAGE
@@ -345,13 +365,18 @@ def create_filesystem(deb_names, add_sources_list: str, third_stage: str = ""):
 
     fs.file("init", second_stage, mode=0o755)
 
-    # These files will get created by dpkg as well..mostly.
-    # There's a risk that zero packages will install these files.
-    # Which is why we create them manually
-    for name in ("bin", "sbin", "lib", "lib32", "lib64", "libx32"):
-        real = f"usr/{name}"
-        fs.mkdir(real)
-        fs.symlink(name, real)
+    if pre_link is None:
+        # These files will get created by dpkg as well..mostly.
+        # There's a risk that zero packages will install these files.
+        # Which is why we create them manually
+        for name in ("bin", "sbin", "lib", "lib32", "lib64", "libx32"):
+            real = f"usr/{name}"
+            fs.mkdir(real)
+            fs.symlink(name, real)
+    else:
+        for name, target in pre_link.items():
+            fs.mkdir(target)
+            fs.symlink(name, target)
 
     debs = get_debs_from_directory(deb_names)
     for member, contents in get_unpacked_files(debs):

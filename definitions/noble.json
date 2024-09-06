@@ -1,9 +1,0 @@
-{
-  "keyring": "ubuntu",
-  "archive_url": "http://archive.ubuntu.com/ubuntu/",
-  "suites": [
-    "noble",
-    "noble-updates"
-  ],
-  "architecture": "amd64"
-}

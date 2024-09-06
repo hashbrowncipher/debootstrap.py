@@ -3,7 +3,6 @@
 * Right now LZMA decoding takes up most of the time. Parallelize it? Python's LZMA
   library does release the GIL.
 """
-import json
 import gzip
 import lzma
 import os
@@ -13,6 +12,7 @@ import sys
 import tarfile
 import threading
 import time
+from argparse import ArgumentParser
 from concurrent.futures import as_completed
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -31,6 +31,8 @@ from tarfile import TarInfo
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlparse
 from wsgiref.handlers import format_date_time
+
+import yaml
 
 from lib.assemble import create_filesystem
 
@@ -146,7 +148,6 @@ def get_needed_packages(packages_info):
             unprocessed.add(dep)
 
     ret = [packages_info[name] for name in required]
-    random.shuffle(ret)
     return ret
 
 
@@ -583,7 +584,7 @@ def get_all_packages_info(architecture, keyring, parsed_archive_url, suites):
     return ret
 
 
-def build_os(*, architecture, keyring, archive_url, suites):
+def build_os(options, *, architecture, keyring, archive_url, suites, pre_link=None):
     parsed_archive_url = urlparse(archive_url)
     packages_info = get_all_packages_info(
         architecture, keyring, parsed_archive_url, suites
@@ -594,9 +595,17 @@ def build_os(*, architecture, keyring, archive_url, suites):
 
     stderr("Creating filesystem")
     deb_paths = download_files(parsed_archive_url, packages)
+    if options.seed is not None:
+        deb_paths = sorted(deb_paths)
+        random.Random(options.seed).shuffle(deb_paths)
+        print(deb_paths)
+    
     sources_entries = [dict(archive_url=archive_url, suite=suite) for suite in suites]
     fs = create_filesystem(
-        deb_paths, add_sources_list=sources_entries, third_stage=THIRD_STAGE
+        deb_paths,
+        add_sources_list=sources_entries,
+        third_stage=THIRD_STAGE,
+        pre_link=pre_link,
     )
 
     stderr("Writing image to docker import")
@@ -634,15 +643,20 @@ def build_os(*, architecture, keyring, archive_url, suites):
 
 
 def main():
-    ostype = sys.argv[1]
+    parser = ArgumentParser()
+    parser.add_argument("--seed")
+    parser.add_argument("ostype")
+    args = parser.parse_args()
+    ostype = args.ostype
+
     if "." in ostype or "/" in ostype:
         raise RuntimeError(ostype)
 
-    with open(f"definitions/{ostype}.json") as f:
-        kwargs = json.load(f)
+    with open(f"definitions/{ostype}.yaml") as f:
+        kwargs = yaml.safe_load(f)
 
     kwargs.setdefault("architecture", "amd64")
-    return build_os(**kwargs)
+    return build_os(args, **kwargs)
 
 
 if __name__ == "__main__":
