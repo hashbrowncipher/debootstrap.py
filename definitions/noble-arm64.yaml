@@ -1,9 +1,11 @@
-{
-  "keyring": "ubuntu",
-  "archive_url": "http://ports.ubuntu.com/ubuntu-ports/",
-  "suites": [
-    "jammy",
-    "jammy-updates"
-  ],
-  "architecture": "arm64"
-}
+---
+keyring: ubuntu
+archive_url: http://ports.ubuntu.com/ubuntu-ports/
+suites:
+- noble
+- noble-updates
+pre_link:
+  bin: /usr/bin
+  lib: /usr/lib
+  sbin: /usr/sbin
+architecture: arm64
