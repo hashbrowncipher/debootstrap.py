@@ -6,13 +6,14 @@ Designed to
 
 Tested to produce images for:
  * Debian (bullseye and sid)
- * Ubuntu (focal and jammy)
+ * Ubuntu (focal, jammy, noble)
  * Kali (rolling and last-snapshot)
 
 # Dependencies 
 
 * A Docker-compatible commandline client at `docker`.
-* `gpgv`, for signature verification.
+* a `gpgv` binary, for signature verification.
+* PyYAML
 * `pip install zstandard`, but only if you want to use debs that contain
 .zst compressed members.
 
