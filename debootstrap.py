@@ -570,13 +570,25 @@ def get_packages(*args):
         return packages_dict(plain_f)
 
 
-def get_all_packages_info(*, architecture: str, keyring, parsed_archive_url: str, suites: list[str], cached: bool):
+def get_all_packages_info(
+    *,
+    architecture: str,
+    keyring,
+    parsed_archive_url: str,
+    suites: list[str],
+    cached: bool,
+):
     futs = []
     with ThreadPoolExecutor() as executor:
         for suite in suites:
             futs.append(
                 executor.submit(
-                    get_packages, architecture, keyring, parsed_archive_url, suite, cached
+                    get_packages,
+                    architecture,
+                    keyring,
+                    parsed_archive_url,
+                    suite,
+                    cached,
                 )
             )
 
@@ -587,7 +599,15 @@ def get_all_packages_info(*, architecture: str, keyring, parsed_archive_url: str
     return ret
 
 
-def build_os(options, *, architecture: str, keyring, archive_url: str, suites: list[str], pre_link=None):
+def build_os(
+    options,
+    *,
+    architecture: str,
+    keyring,
+    archive_url: str,
+    suites: list[str],
+    pre_link=None,
+):
     parsed_archive_url = urlparse(archive_url)
     packages_info = get_all_packages_info(
         architecture=architecture,
@@ -606,7 +626,7 @@ def build_os(options, *, architecture: str, keyring, archive_url: str, suites: l
         deb_paths = sorted(deb_paths)
         random.Random(options.seed).shuffle(deb_paths)
         print(deb_paths)
-    
+
     sources_entries = [dict(archive_url=archive_url, suite=suite) for suite in suites]
     fs = create_filesystem(
         deb_paths,
@@ -651,8 +671,16 @@ def build_os(options, *, architecture: str, keyring, archive_url: str, suites: l
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--cached", action="store_true", help="consults a release snapshot from a previous run instead of fetching from package mirrors")
-    parser.add_argument("--seed", type=int, help="for debugging: forces packages to be processed in a deterministic order")
+    parser.add_argument(
+        "--cached",
+        action="store_true",
+        help="consults a release snapshot from a previous run instead of fetching from package mirrors",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="for debugging: forces packages to be processed in a deterministic order",
+    )
     parser.add_argument("ostype")
     args = parser.parse_args()
     ostype = args.ostype

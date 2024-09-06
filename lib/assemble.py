@@ -231,7 +231,7 @@ class Filesystem:
                 existing.mode |= ti.mode
 
             if extract_useful(ti) != extract_useful(existing):
-                if (existing.type == tarfile.SYMTYPE and ti.type == tarfile.DIRTYPE):
+                if existing.type == tarfile.SYMTYPE and ti.type == tarfile.DIRTYPE:
                     return
 
                 raise RuntimeError(ti.name)
