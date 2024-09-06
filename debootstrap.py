@@ -498,8 +498,11 @@ def fetch_http(netloc, path, follow_redirects=1, **kwargs):
     return r
 
 
-def download_cached(netloc, path):
+def download_cached(netloc, path, *, only_cached: bool):
     destination = CACHE_PATH / (netloc + path)
+    if only_cached:
+        return destination.read_bytes()
+
     try:
         stat = destination.stat()
     except FileNotFoundError:
@@ -526,18 +529,18 @@ def download_cached(netloc, path):
     return ret
 
 
-def get_release_fetcher(keyring, netloc, dist_path):
+def get_release_fetcher(keyring: str, netloc: str, dist_path: str, cached: bool):
     name = dist_path + "Release"
 
-    release = download_cached(netloc, name)
-    release_gpg = download_cached(netloc, dist_path + "Release.gpg")
+    release = download_cached(netloc, name, only_cached=cached)
+    release_gpg = download_cached(netloc, dist_path + "Release.gpg", only_cached=cached)
     gpg_verify(keyring, name, release_gpg, release)
 
     sha256sums = get_sha256sums(release)
 
     def repo_fetch(path):
         expected_checksum = sha256sums[path]
-        contents = download_cached(netloc, dist_path + path)
+        contents = download_cached(netloc, dist_path + path, only_cached=cached)
         actual_checksum = sha256(contents).hexdigest()
 
         if expected_checksum != actual_checksum:
@@ -548,10 +551,10 @@ def get_release_fetcher(keyring, netloc, dist_path):
     return repo_fetch
 
 
-def _get_packages(architecture, keyring, parsed_archive_url, suite):
+def _get_packages(architecture, keyring, parsed_archive_url, suite: str, cached: bool):
     url = (parsed_archive_url.netloc, parsed_archive_url.path + f"dists/{suite}/")
 
-    repo_fetch = get_release_fetcher(keyring, *url)
+    repo_fetch = get_release_fetcher(keyring, *url, cached=cached)
     for pref in PACKAGES_PREFERENCE:
         try:
             return pref, repo_fetch(f"main/binary-{architecture}/Packages{pref}")
@@ -567,13 +570,13 @@ def get_packages(*args):
         return packages_dict(plain_f)
 
 
-def get_all_packages_info(architecture, keyring, parsed_archive_url, suites):
+def get_all_packages_info(*, architecture: str, keyring, parsed_archive_url: str, suites: list[str], cached: bool):
     futs = []
     with ThreadPoolExecutor() as executor:
         for suite in suites:
             futs.append(
                 executor.submit(
-                    get_packages, architecture, keyring, parsed_archive_url, suite
+                    get_packages, architecture, keyring, parsed_archive_url, suite, cached
                 )
             )
 
@@ -584,10 +587,14 @@ def get_all_packages_info(architecture, keyring, parsed_archive_url, suites):
     return ret
 
 
-def build_os(options, *, architecture, keyring, archive_url, suites, pre_link=None):
+def build_os(options, *, architecture: str, keyring, archive_url: str, suites: list[str], pre_link=None):
     parsed_archive_url = urlparse(archive_url)
     packages_info = get_all_packages_info(
-        architecture, keyring, parsed_archive_url, suites
+        architecture=architecture,
+        keyring=keyring,
+        parsed_archive_url=parsed_archive_url,
+        suites=suites,
+        cached=options.cached,
     )
 
     stderr("Evaluating packages to download")
@@ -644,7 +651,8 @@ def build_os(options, *, architecture, keyring, archive_url, suites, pre_link=No
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--seed")
+    parser.add_argument("--cached", action="store_true", help="consults a release snapshot from a previous run instead of fetching from package mirrors")
+    parser.add_argument("--seed", type=int, help="for debugging: forces packages to be processed in a deterministic order")
     parser.add_argument("ostype")
     args = parser.parse_args()
     ostype = args.ostype
