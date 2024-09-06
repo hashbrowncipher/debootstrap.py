@@ -27,7 +27,7 @@ def zstdopen(cls, name, mode="r", fileobj=None, **kwargs):
 
 
 tarfile.TarFile.zstdopen = zstdopen
-tarfile.TarFile.OPEN_METH["zstd"] = "zstdopen"
+tarfile.TarFile.OPEN_METH["zst"] = "zstdopen"
 
 SECOND_STAGE = r"""#!/bin/bash
 set -e
@@ -234,8 +234,8 @@ class Filesystem:
         return write_image(self, *args)
 
 
-def extract_whole_tar(contents):
-    tf = tarfile.open(fileobj=BytesIO(contents))
+def extract_whole_tar(contents, mode):
+    tf = tarfile.open(fileobj=BytesIO(contents), mode=mode)
     ret = dict()
     for ti in tf:
         inner_fh = tf.extractfile(ti)
@@ -260,8 +260,8 @@ def _dpkg_info_files(prefix, control_data, tf):
         yield member, file_contents
 
 
-def handle_control_tar(contents):
-    data = extract_whole_tar(contents)
+def handle_control_tar(contents, mode):
+    data = extract_whole_tar(contents, mode)
     control_data = data["./control"][1].decode()
     prefix, new_control_data = parse_control_data(control_data)
     return prefix, _dpkg_info_files(prefix, new_control_data, data.values())
@@ -273,6 +273,16 @@ def transform_name(name):
         return "/.\n"
 
     return "/" + name + "\n"
+
+
+def split_tar_namemode(name: bytes):
+    # b"control.tar.gz    " -> ("control", "r:gz")
+    cleaned_name = name.strip().decode()
+    root, rest = cleaned_name.split(".tar")
+    ext = rest.lstrip(".")
+    mode = f"r:{ext}"
+    return root, mode
+
 
 
 def unpack_ar(fh):
@@ -291,16 +301,21 @@ def unpack_ar(fh):
         file_contents = fh.read(size)
         fh.read(size % 2)
 
-        if name.startswith(b"data.tar"):
-            tf = tarfile.open(fileobj=BytesIO(file_contents))
+        try:
+            root, mode = split_tar_namemode(name)
+        except ValueError:
+            continue
+
+        if root == "data":
+            tf = tarfile.open(fileobj=BytesIO(file_contents), mode=mode)
             for member in tf:
                 contents = tf.extractfile(member).read() if member.isreg() else None
                 member.name = member.name.lstrip("./")
                 files.append(transform_name(member.name))
                 yield member, contents
 
-        if name.startswith(b"control.tar"):
-            prefix, dpkg_files = handle_control_tar(file_contents)
+        if root == "control":
+            prefix, dpkg_files = handle_control_tar(file_contents, mode)
             yield from dpkg_files
 
     if prefix is None:
